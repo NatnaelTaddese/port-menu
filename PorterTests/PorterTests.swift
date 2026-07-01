@@ -464,6 +464,41 @@ struct ContainerRuntimeTests {
         #expect(map[6379]?.project == "my-redis")
         #expect(map[6379]?.service == "")
     }
+
+    @Test func mapsDevContainerForwardedPortsFromMetadata() {
+        let metadata = #"[{"portsAttributes":{"4200":{"label":"Angular front"}}}]"#
+        let output = "quizzical_davinci\t\t\t\t/Users/garanda/Documents/Angular/frontend_vapor_customer\t" + metadata
+        let map = LivePortScanner.parseContainerOutput(output)
+
+        #expect(map[4200]?.project == "frontend_vapor_customer")
+        #expect(map[4200]?.service == "Angular front")
+    }
+
+    @Test func parsesListeningPortsFromNetworkTools() {
+        let output = """
+        LISTEN 0      511          0.0.0.0:4321       0.0.0.0:*
+        tcp        0      0 0.0.0.0:8080      0.0.0.0:*      LISTEN
+        tcp6       0      0 :::22            :::*           LISTEN
+        """
+        let ports = LivePortScanner.parseListeningPortsFromNetworkTools(output)
+        #expect(ports.contains(4321))
+        #expect(ports.contains(8080))
+        #expect(!ports.contains(22))
+    }
+
+    @Test func parsesOnlyNonLoopbackListeningPortsFromNetworkTools() {
+        let output = """
+        LISTEN 0      511      0.0.0.0:4321    0.0.0.0:*
+        LISTEN 0      511    127.0.0.1:36765   0.0.0.0:*
+        LISTEN 0      511           [::]:5173       [::]:*
+        LISTEN 0      511           [::1]:45437     [::]:*
+        """
+        let ports = LivePortScanner.parseNonLoopbackListeningPortsFromNetworkTools(output)
+        #expect(ports.contains(4321))
+        #expect(ports.contains(5173))
+        #expect(!ports.contains(36765))
+        #expect(!ports.contains(45437))
+    }
 }
 
 // MARK: - PortStore Tests
