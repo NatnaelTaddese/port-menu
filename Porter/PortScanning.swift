@@ -74,10 +74,17 @@ struct LivePortScanner: PortScanning {
         let pids = Set(parsed.map(\.pid))
         let hasContainerPorts = parsed.contains {
             Self.containerRuntimeName(for: $0.processName) != nil
+                || Self.isLikelyContainerForwarder(processName: $0.processName)
         }
         async let cwdResult = resolveCWDs(pids: pids)
         async let startTimeResult = resolveStartTimes(pids: pids)
-        async let containerResult = resolveContainers(enabled: hasContainerPorts)
+        let forwardedPorts = Set(parsed.compactMap { info -> UInt16? in
+            Self.isLikelyContainerForwarder(processName: info.processName) ? info.port : nil
+        })
+        async let containerResult = resolveContainers(
+            enabled: hasContainerPorts,
+            forwardedPorts: forwardedPorts
+        )
         let (cwds, startTimes, containers) = await (cwdResult, startTimeResult, containerResult)
 
         return await resolveProjects(parsed: parsed, cwds: cwds,
@@ -87,8 +94,8 @@ struct LivePortScanner: PortScanning {
     // MARK: - Container Resolution
 
     struct ContainerInfo: Sendable {
-        let project: String   // compose project, or container name if standalone
-        let service: String   // compose service name (empty for standalone containers)
+        let project: String   // compose project, devcontainer folder, or container name
+        let service: String   // compose service or forwarded-port label
     }
 
     // Common install locations for the `docker`-compatible CLI. The same binary
@@ -106,12 +113,20 @@ struct LivePortScanner: PortScanning {
         return candidates.first { fm.isExecutableFile(atPath: $0) }
     }
 
+    private struct ContainerRow: Sendable {
+        let name: String
+        let portsField: String
+        let projectName: String
+        let serviceLabel: String
+        let devContainerPorts: [UInt16: String]
+    }
+
     /// Maps published host ports to their container's compose project/service by
     /// querying the container CLI. Best-effort: returns empty if no runtime ports
     /// were seen, the CLI is missing, or the daemon is unreachable.
-    private func resolveContainers(enabled: Bool) async -> [UInt16: ContainerInfo] {
+    private func resolveContainers(enabled: Bool, forwardedPorts: Set<UInt16>) async -> [UInt16: ContainerInfo] {
         guard enabled, let docker = Self.dockerExecutable() else { return [:] }
-        let format = #"{{.Names}}\t{{.Ports}}\t{{.Label "com.docker.compose.project"}}\t{{.Label "com.docker.compose.service"}}"#
+        let format = #"{{.Names}}\t{{.Ports}}\t{{.Label "com.docker.compose.project"}}\t{{.Label "com.docker.compose.service"}}\t{{.Label "devcontainer.local_folder"}}\t{{.Label "devcontainer.metadata"}}"#
         guard let output = try? await runShell(
             docker, args: ["ps", "--no-trunc", "--format", format],
             timeout: 5
@@ -119,12 +134,70 @@ struct LivePortScanner: PortScanning {
             if Log.isVerbose { log.debug("docker ps lookup failed or timed out") }
             return [:]
         }
-        return Self.parseContainerOutput(output)
+
+        let rows = Self.parseContainerRows(output)
+        var result: [UInt16: ContainerInfo] = [:]
+
+        for row in rows {
+            for port in Self.parseContainerHostPorts(row.portsField) {
+                let detail = row.devContainerPorts[port].flatMap { $0.isEmpty ? nil : $0 } ?? row.serviceLabel
+                result[port] = ContainerInfo(project: row.projectName, service: detail)
+            }
+
+            for (port, label) in row.devContainerPorts where result[port] == nil {
+                let detail = label.isEmpty ? row.serviceLabel : label
+                result[port] = ContainerInfo(project: row.projectName, service: detail)
+            }
+        }
+
+        var unresolvedForwardedPorts = Set(forwardedPorts.filter { result[$0] == nil })
+        if !unresolvedForwardedPorts.isEmpty {
+            for row in rows where result.values.contains(where: { $0.project == row.projectName }) == false {
+                let hasDeclaredPorts = !Self.parseContainerHostPorts(row.portsField).isEmpty
+                    || !row.devContainerPorts.isEmpty
+                if hasDeclaredPorts {
+                    continue
+                }
+
+                let listeningPorts = await resolveContainerListeningPorts(docker: docker, containerName: row.name)
+                let matched = listeningPorts.intersection(unresolvedForwardedPorts)
+                if matched.isEmpty {
+                    continue
+                }
+
+                for port in matched {
+                    result[port] = ContainerInfo(project: row.projectName, service: row.serviceLabel)
+                }
+                unresolvedForwardedPorts.subtract(matched)
+                if unresolvedForwardedPorts.isEmpty {
+                    break
+                }
+            }
+        }
+
+        return result
     }
 
     /// Parses the tab-separated `docker ps` output into a host-port → container map.
     static func parseContainerOutput(_ output: String) -> [UInt16: ContainerInfo] {
+        let rows = parseContainerRows(output)
         var result: [UInt16: ContainerInfo] = [:]
+        for row in rows {
+            for port in parseContainerHostPorts(row.portsField) {
+                let detail = row.devContainerPorts[port].flatMap { $0.isEmpty ? nil : $0 } ?? row.serviceLabel
+                result[port] = ContainerInfo(project: row.projectName, service: detail)
+            }
+
+            for (port, label) in row.devContainerPorts where result[port] == nil {
+                let detail = label.isEmpty ? row.serviceLabel : label
+                result[port] = ContainerInfo(project: row.projectName, service: detail)
+            }
+        }
+        return result
+    }
+
+    private static func parseContainerRows(_ output: String) -> [ContainerRow] {
+        var rows: [ContainerRow] = []
         for line in output.split(separator: "\n", omittingEmptySubsequences: true) {
             let cols = line.components(separatedBy: "\t")
             guard cols.count >= 2 else { continue }
@@ -132,15 +205,38 @@ struct LivePortScanner: PortScanning {
             let portsField = cols[1]
             let projectLabel = cols.count > 2 ? cols[2].trimmingCharacters(in: .whitespaces) : ""
             let serviceLabel = cols.count > 3 ? cols[3].trimmingCharacters(in: .whitespaces) : ""
-            let info = ContainerInfo(
-                project: projectLabel.isEmpty ? name : projectLabel,
-                service: serviceLabel
+            let localFolder = cols.count > 4 ? cols[4].trimmingCharacters(in: .whitespaces) : ""
+            let metadata = cols.count > 5 ? cols[5].trimmingCharacters(in: .whitespaces) : ""
+            rows.append(
+                ContainerRow(
+                    name: name,
+                    portsField: portsField,
+                    projectName: containerProjectName(
+                        containerName: name,
+                        composeProject: projectLabel,
+                        localFolder: localFolder
+                    ),
+                    serviceLabel: serviceLabel,
+                    devContainerPorts: parseDevContainerForwardedPorts(metadata)
+                )
             )
-            for port in parseContainerHostPorts(portsField) {
-                result[port] = info
+        }
+        return rows
+    }
+
+    static func containerProjectName(containerName: String, composeProject: String, localFolder: String) -> String {
+        if !composeProject.isEmpty {
+            return composeProject
+        }
+
+        if !localFolder.isEmpty {
+            let folderName = URL(filePath: localFolder).lastPathComponent
+            if !folderName.isEmpty {
+                return folderName
             }
         }
-        return result
+
+        return containerName
     }
 
     /// Extracts published host ports from a docker `Ports` field, e.g.
@@ -154,6 +250,77 @@ struct LivePortScanner: PortScanning {
             ports.append(port)
         }
         return ports
+    }
+
+    static func parseDevContainerForwardedPorts(_ metadata: String) -> [UInt16: String] {
+        guard !metadata.isEmpty,
+              let data = metadata.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]]
+        else {
+            return [:]
+        }
+
+        var result: [UInt16: String] = [:]
+        for item in json {
+            guard let portsAttributes = item["portsAttributes"] as? [String: Any] else { continue }
+            for (portString, value) in portsAttributes {
+                guard let port = UInt16(portString) else { continue }
+                let label = (value as? [String: Any])?["label"] as? String ?? ""
+                result[port] = label
+            }
+        }
+        return result
+    }
+
+    private func resolveContainerListeningPorts(docker: String, containerName: String) async -> Set<UInt16> {
+        guard let output = try? await runShell(
+            docker,
+            args: [
+                "exec", containerName, "sh", "-lc",
+                "ss -lntH 2>/dev/null || netstat -lnt 2>/dev/null",
+            ],
+            timeout: 3
+        ) else {
+            return []
+        }
+        return Self.parseNonLoopbackListeningPortsFromNetworkTools(output)
+    }
+
+    static func parseListeningPortsFromNetworkTools(_ output: String) -> Set<UInt16> {
+        var result = Set<UInt16>()
+        for line in output.split(separator: "\n", omittingEmptySubsequences: true) {
+            for match in line.matches(of: #/:(\d{1,5})(?:\s|$)/#) {
+                guard let port = UInt16(match.1), port >= 1024, port < 49152 else { continue }
+                result.insert(port)
+            }
+        }
+        return result
+    }
+
+    static func parseNonLoopbackListeningPortsFromNetworkTools(_ output: String) -> Set<UInt16> {
+        var result = Set<UInt16>()
+        let lines = output.split(separator: "\n", omittingEmptySubsequences: true)
+        for line in lines {
+            let fields = line.split(whereSeparator: { $0.isWhitespace })
+            for field in fields {
+                let token = String(field)
+                guard let lastColon = token.lastIndex(of: ":") else { continue }
+                let hostPart = String(token[..<lastColon]).trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+                let portPart = String(token[token.index(after: lastColon)...])
+                guard let port = UInt16(portPart), port >= 1024, port < 49152 else { continue }
+                if isLoopbackHost(hostPart) { continue }
+                result.insert(port)
+            }
+        }
+        return result
+    }
+
+    static func isLoopbackHost(_ host: String) -> Bool {
+        let normalized = host.lowercased()
+        if normalized == "localhost" || normalized == "::1" {
+            return true
+        }
+        return normalized.hasPrefix("127.")
     }
 
     // MARK: - lsof Parsing (static for testability)
@@ -297,9 +464,9 @@ struct LivePortScanner: PortScanning {
             let gitRoot = cwd.flatMap { gitRoots[$0] }
             let rootPath = gitRoot?.path()
             let isContainerRuntime = Self.containerRuntimeName(for: info.processName) != nil
-            let container = isContainerRuntime ? containers[info.port] : nil
+            let container = containers[info.port]
 
-            if gitRoot == nil, !isContainerRuntime,
+            if gitRoot == nil, container == nil, !isContainerRuntime,
                !Self.shouldKeepFallbackProcess(processName: info.processName, cwd: cwd) {
                 if Log.isVerbose {
                     Log.scanner.debug("Skipping non-project process '\(info.processName)' on port \(info.port)")
@@ -333,7 +500,7 @@ struct LivePortScanner: PortScanning {
                 projectName: projectName,
                 branch: branch,
                 startTime: startTimes[info.pid],
-                isContainer: isContainerRuntime
+                isContainer: container != nil || isContainerRuntime
             )
         }
     }
@@ -381,6 +548,14 @@ struct LivePortScanner: PortScanning {
         }
 
         return false
+    }
+
+    static func isLikelyContainerForwarder(processName: String) -> Bool {
+        let normalized = processName.lowercased()
+        return normalized.hasPrefix("code")
+            || normalized.hasPrefix("cursor")
+            || normalized.hasPrefix("codium")
+            || normalized.hasPrefix("windsurf")
     }
 
     // Returns the display label for a container runtime if `name` is one, else nil.
